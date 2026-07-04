@@ -7,5 +7,6 @@ edition = "2024"
 uv-install-wheel = { path = "../uv-install-wheel" }
 uv-normalize = { path = "../uv-normalize" }
 uv-pypi-types = { path = "../uv-pypi-types" }
+uv-distribution-filename = { path = "../uv-distribution-filename" }
 assert_fs = "1.1.4"
 anyhow = "1.0.102"
