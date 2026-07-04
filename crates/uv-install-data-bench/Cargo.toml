@@ -1,0 +1,11 @@
+[package]
+name = "uv-install-data-bench"
+version = "0.0.56"
+edition = "2024"
+
+[dependencies]
+uv-install-wheel = { path = "../uv-install-wheel" }
+uv-normalize = { path = "../uv-normalize" }
+uv-pypi-types = { path = "../uv-pypi-types" }
+assert_fs = "1.1.4"
+anyhow = "1.0.102"
