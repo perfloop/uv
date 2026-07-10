@@ -1,0 +1,8 @@
+docs/guides/integration/docker.md
+docs/guides/integration/gitlab.md
+CHANGELOG.md
+crates/uv-pep440/CHANGELOG.md
+crates/uv-pep508/Changelog.md
+test/ecosystem/home-assistant-core/LICENSE.md
+.venv/
+site/
