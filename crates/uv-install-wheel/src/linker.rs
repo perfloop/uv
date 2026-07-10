@@ -306,6 +306,13 @@ fn register_installed_paths(
     state: &InstallState,
     filename: &WheelFilename,
 ) -> Result<(), Error> {
+    if !state
+        .preview
+        .is_enabled(PreviewFeature::DetectModuleConflicts)
+    {
+        return Ok(());
+    }
+
     for entry in fs::read_dir(wheel)? {
         let entry = entry?;
         let path = entry.path();
