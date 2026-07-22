@@ -12,7 +12,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -41,49 +41,120 @@ use uv_workspace::WorkspaceCache;
 const DOWNLOADS: usize = Concurrency::DEFAULT_DOWNLOADS;
 const CACHE_HITS: usize = 16;
 const SLOW_RESPONSE_DELAY: Duration = Duration::from_millis(75);
-const SATURATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+struct ArrivalSignal {
+    target: usize,
+    arrivals: AtomicUsize,
+    sender: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    receiver: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+impl ArrivalSignal {
+    fn new(target: usize) -> Self {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        Self {
+            target,
+            arrivals: AtomicUsize::new(0),
+            sender: Mutex::new(Some(sender)),
+            receiver: tokio::sync::Mutex::new(Some(receiver)),
+        }
+    }
+
+    fn record(&self) {
+        let arrived = self.arrivals.fetch_add(1, Ordering::SeqCst) + 1;
+        if arrived == self.target {
+            if let Some(sender) = self.sender.lock().unwrap().take() {
+                let _ = sender.send(());
+            }
+        }
+    }
+
+    fn count(&self) -> usize {
+        self.arrivals.load(Ordering::SeqCst)
+    }
+
+    async fn wait_for_target(&self) -> Result<()> {
+        let receiver = self
+            .receiver
+            .lock()
+            .await
+            .take()
+            .context("arrival target was already awaited")?;
+        receiver
+            .await
+            .context("arrival target sender was dropped before the target was reached")?;
+        Ok(())
+    }
+}
+
+/// Holds delayed PEP 658 responses until the test has observed their arrival. The gate makes the
+/// arrival, hold, and release conditions deterministic; the response delay begins only after the
+/// test releases the gate.
+struct SlowGate {
+    arrivals: ArrivalSignal,
+    released: Mutex<bool>,
+    release_changed: Condvar,
+}
+
+impl SlowGate {
+    fn new(arrival_target: usize) -> Self {
+        Self {
+            arrivals: ArrivalSignal::new(arrival_target),
+            released: Mutex::new(false),
+            release_changed: Condvar::new(),
+        }
+    }
+
+    fn arrive_and_wait(&self) {
+        self.arrivals.record();
+        let mut released = self.released.lock().unwrap();
+        while !*released {
+            released = self.release_changed.wait(released).unwrap();
+        }
+    }
+
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release_changed.notify_all();
+    }
+
+    fn arrival_count(&self) -> usize {
+        self.arrivals.count()
+    }
+
+    async fn wait_for_arrivals(&self) -> Result<()> {
+        self.arrivals.wait_for_target().await
+    }
+}
 
 #[derive(Default)]
 struct ServerStats {
     requests: AtomicUsize,
-    slow_started: AtomicUsize,
-    slow_in_flight: AtomicUsize,
-    max_slow_in_flight: AtomicUsize,
 }
 
-impl ServerStats {
-    fn start_slow_request(&self) {
-        self.slow_started.fetch_add(1, Ordering::SeqCst);
-        let in_flight = self.slow_in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.max_slow_in_flight
-            .fetch_max(in_flight, Ordering::SeqCst);
-    }
-
-    fn finish_slow_request(&self) {
-        self.slow_in_flight.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
-/// A tiny local PEP 658 server. It delays real metadata HTTP responses for package names that
+/// A tiny local PEP 658 server. It holds real metadata HTTP responses for package names that
 /// start with `slow`; cached package names receive the same valid metadata without a delay.
 struct MetadataServer {
     base_url: String,
     stats: Arc<ServerStats>,
+    slow_gate: Arc<SlowGate>,
     stopping: Arc<AtomicBool>,
     accept_thread: Option<JoinHandle<()>>,
     workers: Arc<Mutex<Vec<JoinHandle<()>>>>,
 }
 
 impl MetadataServer {
-    fn start() -> Result<Self> {
+    fn start(slow_arrival_target: usize) -> Result<Self> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         listener.set_nonblocking(true)?;
         let base_url = format!("http://{}", listener.local_addr()?);
         let stats = Arc::new(ServerStats::default());
+        let slow_gate = Arc::new(SlowGate::new(slow_arrival_target));
         let stopping = Arc::new(AtomicBool::new(false));
         let workers = Arc::new(Mutex::new(Vec::new()));
 
         let accept_stats = Arc::clone(&stats);
+        let accept_slow_gate = Arc::clone(&slow_gate);
         let accept_stopping = Arc::clone(&stopping);
         let accept_workers = Arc::clone(&workers);
         let accept_thread = thread::Builder::new()
@@ -93,7 +164,9 @@ impl MetadataServer {
                     match listener.accept() {
                         Ok((stream, _)) => {
                             let stats = Arc::clone(&accept_stats);
-                            let worker = thread::spawn(move || serve_connection(stream, stats));
+                            let slow_gate = Arc::clone(&accept_slow_gate);
+                            let worker =
+                                thread::spawn(move || serve_connection(stream, stats, slow_gate));
                             accept_workers.lock().unwrap().push(worker);
                         }
                         Err(err) if err.kind() == io::ErrorKind::WouldBlock => {
@@ -108,6 +181,7 @@ impl MetadataServer {
         Ok(Self {
             base_url,
             stats,
+            slow_gate,
             stopping,
             accept_thread: Some(accept_thread),
             workers,
@@ -122,21 +196,14 @@ impl MetadataServer {
         self.stats.requests.load(Ordering::SeqCst)
     }
 
-    fn slow_started(&self) -> usize {
-        self.stats.slow_started.load(Ordering::SeqCst)
-    }
-
-    fn slow_in_flight(&self) -> usize {
-        self.stats.slow_in_flight.load(Ordering::SeqCst)
-    }
-
-    fn max_slow_in_flight(&self) -> usize {
-        self.stats.max_slow_in_flight.load(Ordering::SeqCst)
+    fn slow_gate(&self) -> Arc<SlowGate> {
+        Arc::clone(&self.slow_gate)
     }
 }
 
 impl Drop for MetadataServer {
     fn drop(&mut self) {
+        self.slow_gate.release();
         self.stopping.store(true, Ordering::SeqCst);
         if let Some(thread) = self.accept_thread.take() {
             let _ = thread.join();
@@ -147,8 +214,7 @@ impl Drop for MetadataServer {
     }
 }
 
-fn serve_connection(mut stream: TcpStream, stats: Arc<ServerStats>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(1)));
+fn serve_connection(mut stream: TcpStream, stats: Arc<ServerStats>, slow_gate: Arc<SlowGate>) {
     let Ok(request) = read_request(&mut stream) else {
         return;
     };
@@ -166,9 +232,8 @@ fn serve_connection(mut stream: TcpStream, stats: Arc<ServerStats>) {
         .next()
         .is_some_and(|filename| filename.starts_with("slow"));
     if is_slow {
-        stats.start_slow_request();
+        slow_gate.arrive_and_wait();
         thread::sleep(SLOW_RESPONSE_DELAY);
-        stats.finish_slow_request();
     }
 
     let body = metadata_body(path);
@@ -228,8 +293,8 @@ struct Fixture {
 }
 
 impl Fixture {
-    async fn new(downloads: usize) -> Result<Self> {
-        let server = MetadataServer::start()?;
+    async fn new(downloads: usize, slow_arrival_target: usize) -> Result<Self> {
+        let server = MetadataServer::start(slow_arrival_target)?;
         let cache = Cache::temp()?.init().await?;
         let interpreter = Interpreter::query(find_python()?, &cache)?;
         let concurrency = Concurrency::new(downloads, 1, 1, CACHE_HITS);
@@ -353,6 +418,31 @@ async fn fetch_metadata<ContextType: BuildContext>(
     Ok(())
 }
 
+/// Starts timing before the database operation and signals only after that operation has actually
+/// been polled once. On the baseline, this means each cache lookup has reached the real semaphore
+/// acquisition before the delayed responses are released.
+async fn timed_cache_fetch<ContextType: BuildContext>(
+    database: &DistributionDatabase<'_, ContextType>,
+    dist: &Dist,
+    started: &ArrivalSignal,
+) -> Result<Duration> {
+    let started_at = Instant::now();
+    let operation = database.get_or_build_wheel_metadata(dist, HashPolicy::None);
+    tokio::pin!(operation);
+    let mut was_polled = false;
+    let metadata = future::poll_fn(|context| {
+        let poll = operation.as_mut().poll(context);
+        if !was_polled {
+            was_polled = true;
+            started.record();
+        }
+        poll
+    })
+    .await?;
+    black_box(metadata);
+    Ok(started_at.elapsed())
+}
+
 struct Measurement {
     p50: Duration,
     p99: Duration,
@@ -360,43 +450,39 @@ struct Measurement {
     saturated_downloads: usize,
 }
 
-async fn wait_for_saturation<F>(
-    server: &MetadataServer,
+/// Drive the slow requests until their real HTTP handlers have arrived at the server's hold gate.
+/// A response cannot complete before the gate is released, so completion before the signal is a
+/// correctness failure rather than a time-window assertion.
+async fn wait_for_slow_gate<F>(
+    slow_gate: &SlowGate,
     slow_requests: &mut FuturesUnordered<F>,
-    expected: usize,
 ) -> Result<()>
 where
     F: Future<Output = Result<()>>,
 {
-    let deadline = Instant::now() + SATURATION_TIMEOUT;
+    let arrivals = slow_gate.wait_for_arrivals();
+    tokio::pin!(arrivals);
     loop {
-        if server.slow_in_flight() == expected {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!(
-                "timed out waiting for {expected} delayed metadata requests; only {} entered the server",
-                server.slow_started()
-            );
-        }
-
         tokio::select! {
+            result = &mut arrivals => {
+                result?;
+                return Ok(());
+            }
             result = slow_requests.next() => {
                 match result {
                     Some(result) => {
                         result?;
-                        bail!("a delayed metadata request completed before the download lane saturated");
+                        bail!("a delayed metadata request completed before the server gate was released");
                     }
-                    None => bail!("delayed metadata requests ended before the download lane saturated"),
+                    None => bail!("delayed metadata requests ended before reaching the server gate"),
                 }
             }
-            () = tokio::time::sleep(Duration::from_millis(1)) => {}
         }
     }
 }
 
 async fn saturated_cache_hit_workload() -> Result<Measurement> {
-    let fixture = Fixture::new(DOWNLOADS).await?;
+    let fixture = Fixture::new(DOWNLOADS, DOWNLOADS).await?;
     let build_context = fixture.build_context();
     let database = DistributionDatabase::new(
         &fixture.client,
@@ -418,32 +504,65 @@ async fn saturated_cache_hit_workload() -> Result<Measurement> {
     let slow = (0..DOWNLOADS)
         .map(|index| fixture.distribution(&format!("slow{index}")))
         .collect::<Result<Vec<_>>>()?;
+    let slow_gate = fixture.server.slow_gate();
     let mut slow_requests = FuturesUnordered::new();
     for dist in &slow {
         slow_requests.push(fetch_metadata(&database, dist));
     }
-    wait_for_saturation(&fixture.server, &mut slow_requests, DOWNLOADS).await?;
+    wait_for_slow_gate(&slow_gate, &mut slow_requests).await?;
     ensure!(
-        fixture.server.slow_started() == DOWNLOADS,
-        "cache-hit timing begins only after every delayed request entered the real download lane"
+        slow_gate.arrival_count() == DOWNLOADS,
+        "cache-hit timing begins only after every delayed request reached the server hold gate"
+    );
+    ensure!(
+        fixture.concurrency.downloads_semaphore.available_permits() == 0,
+        "the delayed metadata requests must hold every real download permit"
     );
 
     let requests_before_cache_hits = fixture.server.requests();
-    let cache_hits = future::join_all(cached.iter().map(|dist| async {
-        let started = Instant::now();
-        fetch_metadata(&database, dist).await?;
-        Ok::<Duration, anyhow::Error>(started.elapsed())
-    }));
-    let finish_slow_requests = async {
-        while let Some(result) = slow_requests.next().await {
-            result?;
-        }
-        Ok::<(), anyhow::Error>(())
-    };
-    let (cache_hits, slow_result) = futures::join!(cache_hits, finish_slow_requests);
-    slow_result?;
+    let cache_starts = Arc::new(ArrivalSignal::new(CACHE_HITS));
+    let mut cache_requests = FuturesUnordered::new();
+    for dist in &cached {
+        let cache_starts = Arc::clone(&cache_starts);
+        cache_requests.push(timed_cache_fetch(&database, dist, &cache_starts));
+    }
 
-    let mut latencies = cache_hits.into_iter().collect::<Result<Vec<_>>>()?;
+    let cache_start_wait = cache_starts.wait_for_target();
+    tokio::pin!(cache_start_wait);
+    let mut latencies = Vec::with_capacity(CACHE_HITS);
+    loop {
+        tokio::select! {
+            result = &mut cache_start_wait => {
+                result?;
+                break;
+            }
+            result = cache_requests.next() => {
+                match result {
+                    Some(result) => latencies.push(result?),
+                    None => bail!("cache-hit requests ended before they were all polled"),
+                }
+            }
+        }
+    }
+    ensure!(
+        cache_starts.count() == CACHE_HITS,
+        "every cache-hit operation must be polled before delayed responses are released"
+    );
+
+    // The server gate, not a scheduler deadline, controls the duration for which the real
+    // download permits remain occupied after the cache-hit class has attempted the database path.
+    slow_gate.release();
+    while let Some(result) = cache_requests.next().await {
+        latencies.push(result?);
+    }
+    while let Some(result) = slow_requests.next().await {
+        result?;
+    }
+
+    ensure!(
+        latencies.len() == CACHE_HITS,
+        "the workload must observe every cache-hit result"
+    );
     latencies.sort_unstable();
     let p50 = latencies[latencies.len() / 2];
     let p99_index = (latencies.len() * 99).div_ceil(100) - 1;
@@ -453,43 +572,55 @@ async fn saturated_cache_hit_workload() -> Result<Measurement> {
         cache_hit_http_requests == 0,
         "fresh PEP 658 cache hits must not make HTTP requests"
     );
-    ensure!(
-        fixture.server.max_slow_in_flight() == DOWNLOADS,
-        "the delayed requests should occupy all {DOWNLOADS} shared download permits"
-    );
 
     Ok(Measurement {
         p50,
         p99,
         cache_hit_http_requests,
-        saturated_downloads: fixture.server.max_slow_in_flight(),
+        saturated_downloads: slow_gate.arrival_count(),
     })
 }
 
 async fn one_permit_network_workload() -> Result<()> {
-    let fixture = Fixture::new(1).await?;
+    let fixture = Fixture::new(1, 1).await?;
     let build_context = fixture.build_context();
     let database = DistributionDatabase::new(
         &fixture.client,
         &build_context,
         Arc::clone(&fixture.concurrency.downloads_semaphore),
     );
-    let slow = [
-        fixture.distribution("slowlima")?,
-        fixture.distribution("slowlimb")?,
-    ];
-    let results = future::join_all(slow.iter().map(|dist| fetch_metadata(&database, dist))).await;
-    for result in results {
-        result?;
-    }
+    let slow_gate = fixture.server.slow_gate();
+    let first = fixture.distribution("slowfirst")?;
+    let mut first_request = FuturesUnordered::new();
+    first_request.push(fetch_metadata(&database, &first));
+    wait_for_slow_gate(&slow_gate, &mut first_request).await?;
 
     ensure!(
-        fixture.server.slow_started() == slow.len(),
-        "both cold PEP 658 metadata requests must reach the real server"
+        slow_gate.arrival_count() == 1,
+        "the cold metadata request must reach the real server before the permit check"
     );
     ensure!(
-        fixture.server.max_slow_in_flight() == 1,
-        "cold metadata network requests exceeded the one-permit download limit"
+        fixture.concurrency.downloads_semaphore.available_permits() == 0,
+        "a held cold metadata response must consume the supplied download permit"
+    );
+    ensure!(
+        fixture
+            .concurrency
+            .downloads_semaphore
+            .try_acquire()
+            .is_err(),
+        "cold metadata networking must remain constrained by the supplied one-permit semaphore"
+    );
+
+    slow_gate.release();
+    while let Some(result) = first_request.next().await {
+        result?;
+    }
+    let second = fixture.distribution("slowsecond")?;
+    fetch_metadata(&database, &second).await?;
+    ensure!(
+        slow_gate.arrival_count() == 2,
+        "the next cold metadata request must proceed after the held response is released"
     );
     Ok(())
 }
@@ -524,7 +655,7 @@ fn main() -> Result<()> {
         measurement.cache_hit_http_requests
     );
     println!(
-        "{{\"metric\":\"saturated_downloads_in_flight\",\"value\":{}}}",
+        "{{\"metric\":\"saturated_downloads_arrived\",\"value\":{}}}",
         measurement.saturated_downloads
     );
     Ok(())
