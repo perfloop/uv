@@ -475,8 +475,8 @@ async fn one_permit_network_workload() -> Result<()> {
         Arc::clone(&fixture.concurrency.downloads_semaphore),
     );
     let slow = [
-        fixture.distribution("slow-limit-a")?,
-        fixture.distribution("slow-limit-b")?,
+        fixture.distribution("slowlima")?,
+        fixture.distribution("slowlimb")?,
     ];
     let results = future::join_all(slow.iter().map(|dist| fetch_metadata(&database, dist))).await;
     for result in results {
