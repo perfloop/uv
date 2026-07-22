@@ -501,8 +501,15 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("build current-thread Tokio runtime")
 }
 
-#[test]
-fn cached_metadata_behind_saturated_downloads() -> Result<()> {
+fn main() -> Result<()> {
+    let selector = std::env::args()
+        .nth(1)
+        .context("expected the cached metadata benchmark selector")?;
+    ensure!(
+        selector == "cached_metadata_behind_saturated_downloads",
+        "unknown benchmark selector: {selector}"
+    );
+
     let measurement = runtime().block_on(saturated_cache_hit_workload())?;
     println!(
         "{{\"metric\":\"cached_metadata_p99_latency_ns\",\"value\":{}}}",
