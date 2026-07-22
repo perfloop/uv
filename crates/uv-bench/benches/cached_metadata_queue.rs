@@ -9,6 +9,7 @@ use std::future::Future;
 use std::hint::black_box;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -230,8 +231,7 @@ impl Fixture {
     async fn new(downloads: usize) -> Result<Self> {
         let server = MetadataServer::start()?;
         let cache = Cache::temp()?.init().await?;
-        let python = std::env::var_os("PYTHON").unwrap_or_else(|| "python3".into());
-        let interpreter = Interpreter::query(python, &cache)?;
+        let interpreter = Interpreter::query(find_python()?, &cache)?;
         let concurrency = Concurrency::new(downloads, 1, 1, CACHE_HITS);
         let client = RegistryClientBuilder::new(
             BaseClientBuilder::default().cache_read_concurrency(concurrency.cache_reads),
@@ -312,6 +312,31 @@ impl Fixture {
             sdist: None,
         })))
     }
+}
+
+fn find_python() -> Result<PathBuf> {
+    if let Some(configured) = std::env::var_os("PYTHON") {
+        let configured = PathBuf::from(configured);
+        if configured.is_file() {
+            return configured
+                .canonicalize()
+                .context("failed to canonicalize the configured Python interpreter");
+        }
+    }
+
+    let path = std::env::var_os("PATH").context("PATH is required to locate Python")?;
+    for directory in std::env::split_paths(&path) {
+        for name in ["python3", "python", "python.exe"] {
+            let candidate = directory.join(name);
+            if candidate.is_file() {
+                return candidate
+                    .canonicalize()
+                    .context("failed to canonicalize the Python interpreter");
+            }
+        }
+    }
+
+    bail!("a Python interpreter is required to construct BuildDispatch")
 }
 
 async fn fetch_metadata<ContextType: BuildContext>(
