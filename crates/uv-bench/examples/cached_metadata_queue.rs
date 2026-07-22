@@ -424,7 +424,7 @@ async fn fetch_metadata<ContextType: BuildContext>(
 async fn timed_cache_fetch<ContextType: BuildContext>(
     database: &DistributionDatabase<'_, ContextType>,
     dist: &Dist,
-    started: &ArrivalSignal,
+    started: Arc<ArrivalSignal>,
 ) -> Result<Duration> {
     let started_at = Instant::now();
     let operation = database.get_or_build_wheel_metadata(dist, HashPolicy::None);
@@ -524,7 +524,7 @@ async fn saturated_cache_hit_workload() -> Result<Measurement> {
     let mut cache_requests = FuturesUnordered::new();
     for dist in &cached {
         let cache_starts = Arc::clone(&cache_starts);
-        cache_requests.push(timed_cache_fetch(&database, dist, &cache_starts));
+        cache_requests.push(timed_cache_fetch(&database, dist, cache_starts));
     }
 
     let cache_start_wait = cache_starts.wait_for_target();
