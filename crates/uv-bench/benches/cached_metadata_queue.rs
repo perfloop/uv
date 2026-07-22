@@ -293,7 +293,7 @@ impl Fixture {
         let file = File {
             dist_info_metadata: true,
             filename: filename.to_string().into(),
-            hashes: HashDigests::default(),
+            hashes: HashDigests::empty(),
             requires_python: None,
             size: None,
             upload_time_utc_ms: None,
